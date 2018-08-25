@@ -81,14 +81,34 @@ use logger::d;
 
 pub struct Syncer {}
 
-#[derive(Debug,PartialEq)]
+#[derive(Debug,PartialEq,Clone)]
+pub enum SyncFollowup {
+    None,
+    FullSync,
+}
+
+impl fmt::Display for SyncFollowup {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            SyncFollowup::None => write!(f, "None"),
+            SyncFollowup::FullSync => write!(f, "Full sync"),
+        }
+    }
+}
+
+#[derive(Debug,PartialEq,Clone)]
 pub enum SyncReport {
     IncompatibleRemoteBootstrap(i64, i64),
     BadRemoteState(String),
     NoChanges,
     RemoteFastForward,
     LocalFastForward,
-    Merge,
+    Merge(SyncFollowup),
+}
+
+pub enum SyncResult {
+    Atomic(SyncReport),
+    NonAtomic(Vec<SyncReport>),
 }
 
 impl fmt::Display for SyncReport {
@@ -109,8 +129,23 @@ impl fmt::Display for SyncReport {
             SyncReport::LocalFastForward => {
                 write!(f, "Fast-forwarded local")
             },
-            SyncReport::Merge => {
-                write!(f, "Merged local and remote")
+            SyncReport::Merge(follow_up) => {
+                write!(f, "Merged local and remote, requesting a follow-up: {}", follow_up)
+            }
+        }
+    }
+}
+
+impl fmt::Display for SyncResult {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            SyncResult::Atomic(report) => write!(f, "Single atomic sync: {}", report),
+            SyncResult::NonAtomic(reports) => {
+                writeln!(f, "Series of atomic syncs ({})", reports.len());
+                for report in reports {
+                    writeln!(f, "{}", report);
+                }
+                writeln!(f, "\\o/")
             }
         }
     }
@@ -372,8 +407,8 @@ impl Syncer {
             &ip.schema,
             ip.partition_map.clone(),
             local_txs_to_merge[0].tx..,
-                // A poor man's parent reference. This might be brittle.
-                // Excisions are prohibited in the 'tx' partition, so this should hold...
+            // A poor man's parent reference. This might be brittle, although
+            // excisions are prohibited in the 'tx' partition, so this should hold...
             local_txs_to_merge[0].tx - 1
         )?;
         match new_schema {
@@ -412,15 +447,9 @@ impl Syncer {
             remote_report = Some((ip.transact_builder(builder)?.tx_id, remote_tx));
         }
 
-        // If the below set of local transactions are all "no-ops" in context of the remote transactions,
-        // we've just reached our final db state. Set a savepoint, so that we can return to it easily.
-
-        d(&format!("Savepoint before transacting local..."));
-        ip.savepoint("speculative_local")?;
-
         d(&format!("Transacting local on top of incoming..."));
         // 3) Rebase local transactions on top of remote.
-        let mut local_applied_as_noops = true;
+        let mut clean_rebase = true;
         for local_tx in local_txs_to_merge {
             let mut builder = TermBuilder::new();
 
@@ -432,13 +461,63 @@ impl Syncer {
             // In the latter case, rewrite it as a tempid, and let the transactor allocate it.
             let mut entids_that_will_allocate = HashSet::new();
 
+            // We currently support "strict schema merging": we'll smush attribute definitions,
+            // but only if they're the same.
+            // e.g. prohibited would be defining different cardinality for the same attribute.
+            // Defining new attributes is allowed if:
+            // - attribute is defined either on local or remote,
+            // - attribute is defined on both local and remote in the same way.
+            // Modifying an attribute is currently not supported (requires higher order schema migrations).
+            // Note that "same" local and remote attributes might have different entids in the
+            // two sets of transactions.
+
+            // Set of entities that may alter "installed" attribute.
+            // Since this is a rebase of local on top of remote, an "installed"
+            // attribute might be one that was present in the root, or one that was
+            // defined by remote.
+            let mut might_alter_installed_attributes = HashSet::new();
+
+            // Set of entities that describe a new attribute, not present in the root
+            // or on the remote.
+            let mut will_not_alter_installed_attribute = HashSet::new();
+
+            d(&format!("\n\nDATOMZ::\n\n{}", debug::dump_sql_query(&ip.transaction, "SELECT * from datoms", &[])?));
+
+            // Go through local datoms, and classify any schema-altering entids into
+            // one of the two sets above.
+            for part in &local_tx.parts {
+                // If we have an ident definition locally, check if remote
+                // already defined this ident. If it did, we'll need to ensure
+                // both local and remote are defining it in the same way.
+                if part.a == entids::DB_IDENT {
+                    match part.v {
+                        TypedValue::Keyword(ref local_kw) => {
+                            // Remote did not define this ident. Make a note of it,
+                            // so that we'll know to ignore its attribute datoms.
+                            if !ip.schema.ident_map.contains_key(local_kw) {
+                                will_not_alter_installed_attribute.insert(part.e);
+
+                            // Otherwise, we'll need to ensure we have the same attribute definition
+                            // for it.
+                            } else {
+                                might_alter_installed_attributes.insert(part.e);
+                            }
+                        },
+                        _ => panic!("programming error: wrong value type for a local ident")
+                    }
+                } else if entids::is_a_schema_attribute(part.a) && !will_not_alter_installed_attribute.contains(&part.e) {
+                    might_alter_installed_attributes.insert(part.e);
+                }
+            }
+
             // Note that at this point, remote and local have flipped - we're transacting
             // local on top of incoming (which are already in the schema).
             for part in &local_tx.parts {
                 match part.a {
                     // We'll be ignoring this datom later on (to be generated by the transactor).
-                    // Generally, here we're only concerned with entities in the user partition,
-                    // while this falls into the inner tx partition.
+                    // During a merge we're concerned with entities in the "user" partition,
+                    // while this falls into the "tx" partition.
+                    // We have preserved the original txInstant value on the alternate timeline.
                     entids::DB_TX_INSTANT => continue,
 
                     // 'e's will be replaced with tempids, letting transactor handle everything.
@@ -448,6 +527,20 @@ impl Syncer {
                     },
                 }
             }
+
+            // :db/ident is a db.unique/identity attribute, which means transactor will upsert
+            // attribute assertions. E.g. if a new attribute was defined on local and not on remote,
+            // it will be inserted. If both local and remote defined the same attribute
+            // with different entids, we'll converge and use remote's entid.
+
+            // Same follows for other types of db.unique/identity attributes.
+            // If user-defined attribute is db.unique/identity, we'll "smush" local and remote
+            // assertions against it.
+            // For example, {:p/name "Grisha"} assertion on local and
+            // {:p/name "Grisha"} assertion on remote will result in a single entity.
+
+            // If user-defined attribute is not unique, however, no smushing will be performed.
+            // The above example will result in two entities.
 
             for part in local_tx.parts {
                 // Skip the "tx instant" datom: it will be generated by our transactor.
@@ -487,33 +580,40 @@ impl Syncer {
                 }
             }
 
+            d(&format!("Savepoint before transacting a local tx..."));
+            ip.savepoint("speculative_local")?;
+
             d(&format!("Transacting builder filled with local txs... {:?}", builder));
-            let report = ip.transact_builder(builder);
-            println!("report: {:?}", report);
+            println!("--- PMAP {:?}", ip.partition_map);
+            let report = ip.transact_builder(builder)?;
+
+            // Let's check that we didn't modify any schema attributes.
+            // Our current attribute map in the schema isn't rich enough to allow
+            // for this check: it's missing a notion of "attribute absence" - we can't
+            // distinguish between a missing attribute and a default value.
+            // Instead, we simply query the database, checking if transaction produced
+            // any schema-altering datoms.
+            for e in might_alter_installed_attributes.iter() {
+                match report.tempids.get(&format!("{}", e)) {
+                    Some(resolved_e) => {
+                        if SyncMetadata::has_entity_assertions_in_tx(&ip.transaction, *resolved_e, report.tx_id)? {
+                            bail!(TolstoyError::NotYetImplemented("Can't sync with schema alterations yet.".to_string()));
+                        }
+                    },
+                    None => ()
+                }
+            }
 
             d(&format!("\n\nTRANSACTIONS::\n\n{}", debug::dump_sql_query(&ip.transaction, "SELECT * from timelined_transactions", &[])?));
 
-            let report = report?;
             if !SyncMetadata::is_tx_empty(&ip.transaction, report.tx_id)? {
-                d(&format!("tx {} is not a no-op, abort!", report.tx_id));
-                local_applied_as_noops = false;
-                break;
+                d(&format!("tx {} is not a no-op", report.tx_id));
+                clean_rebase = false;
+                ip.release_savepoint("speculative_local")?;
             } else {
-                d(&format!("Applied tx {} as a no-op!", report.tx_id));
+                d(&format!("Applied tx {} as a no-op. Rolling back the savepoint (empty tx clean-up).", report.tx_id));
+                ip.rollback_savepoint("speculative_local")?;
             }
-        }
-
-        // This will undo whatever we did in step 3.
-        // That includes any changes to transactions table and materialized views.
-        d(&format!("Rolling back savepoint..."));
-        ip.rollback_savepoint("speculative_local")?;
-
-        // TODO next step here is to allow rebases of operations over non-intersecting entities.
-        // Step after is to start implementing merging algorithms for conflict resolution.
-        if !local_applied_as_noops {
-            bail!(TolstoyError::NotYetImplemented(
-                format!("Local has transactions which are not a subset of remote transactions.")
-            ))
         }
 
         // TODO
@@ -526,7 +626,12 @@ impl Syncer {
             SyncMetadata::set_remote_head_and_map(&mut ip.transaction, (entid, &uuid).into())?;
         }
 
-        Ok(SyncReport::Merge)
+        // If necessary, request a full sync as a follow-up to fast-forward remote.
+        if clean_rebase {
+            Ok(SyncReport::Merge(SyncFollowup::None))
+        } else {
+            Ok(SyncReport::Merge(SyncFollowup::FullSync))
+        }
     }
 
     fn first_sync_against_non_empty<R>(ip: &mut InProgress, remote_client: &R, local_metadata: &SyncMetadata) -> Result<SyncReport>
@@ -573,7 +678,7 @@ impl Syncer {
         // "local fast-forward" cases are reported as merges.
         match Syncer::what_do(remote_state, local_state) {
             SyncAction::NoOp => {
-                Ok(SyncReport::Merge)
+                Ok(SyncReport::Merge(SyncFollowup::None))
             },
 
             SyncAction::PopulateRemote => {
@@ -587,7 +692,7 @@ impl Syncer {
 
             SyncAction::LocalFastForward => {
                 Syncer::fast_forward_local(ip, incoming_txs[1 ..].to_vec())?;
-                Ok(SyncReport::Merge)
+                Ok(SyncReport::Merge(SyncFollowup::None))
             },
 
             SyncAction::CombineChanges => {
