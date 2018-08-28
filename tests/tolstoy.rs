@@ -871,7 +871,7 @@ mod tolstoy_tests {
         assert_sync!(SyncReport::RemoteFastForward, conn_1, sqlite_1, remote_client);
 
         // Merge bootstrap+schema transactions from 1 into 2.
-        // Will result in two Ivans.
+        // Merge will result in two Ivans.
         assert_sync!(SyncReport::Merge(SyncFollowup::FullSync), conn_2, sqlite_2, remote_client);
         // Upload the second Ivan.
         assert_sync!(SyncReport::RemoteFastForward, conn_2, sqlite_2, remote_client);
@@ -887,12 +887,12 @@ mod tolstoy_tests {
 
         // Second renames an Ivan.
         conn_2.transact(&mut sqlite_2, r#"[
-            {:db/id 65537 :person/name "Vanya"}]"#).expect("transacted");
+            [:db/add 65537 :person/name "Vanya"]]"#).expect("transacted");
 
-        // First syncs first.
+        // First wins the sync race.
         assert_sync!(SyncReport::RemoteFastForward, conn_1, sqlite_1, remote_client);
 
-        // And now, merge!
+        // Second merges its changes with first's.
         assert_sync!(SyncReport::Merge(SyncFollowup::FullSync), conn_2, sqlite_2, remote_client);
 
         // We currently have a primitive conflict resolution strategy,
@@ -915,12 +915,8 @@ mod tolstoy_tests {
             [65537 :person/name "Ivan" ?tx false]
             [?tx :db/txInstant ?ms ?tx true]]"#);
 
-        // TODO this currently faily because there's an extra
-        // [65538 :person/name "Ivan" ?tx false] assertion...
-
         assert_matches!(parts_to_datoms(&conn_2.current_schema(), &synced_txs_2[4].parts), r#"[
-            [65538 :person/name "Ivan" ?tx false]
-            [65538 :person/name "Vanya" ?tx true]
+            [65539 :person/name "Vanya" ?tx true]
             [?tx :db/txInstant ?ms ?tx true]]"#);
     }
 

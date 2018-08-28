@@ -380,6 +380,91 @@ mod tests {
     }
 
     #[test]
+    fn test_maybe_buggy() {
+        let mut conn = TestConn::default();
+        conn.sanitized_partition_map();
+
+        assert_transact!(conn, r#"
+            [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+        "#);
+
+        assert_transact!(conn, r#"[{:person/name "Ivan"}]"#);
+        assert_transact!(conn, r#"[{:person/name "Ivan"}]"#);
+
+        assert_transact!(conn, r#"[[:db/add 65537 :person/name "Vanya"]]"#);
+
+        // Move the last assertion away from the main timeline.
+        let (new_schema, new_partition_map) = move_from_main_timeline(
+            &conn.sqlite, &conn.schema, conn.partition_map.clone(),
+            conn.last_tx_id().., 1
+        ).expect("moved single tx");
+        update_conn(&mut conn, &new_schema, &new_partition_map);
+
+        // Assert that our datoms are now just the schema.
+        assert_matches!(conn.datoms(), r#"
+            [[?e :db/ident :person/name]
+            [?e :db/valueType :db.type/string]
+            [?e :db/cardinality :db.cardinality/one]
+            [65537 :person/name "Ivan"]
+            [65538 :person/name "Ivan"]]"#);
+        // Same for transactions.
+        assert_matches!(conn.transactions(), r#"
+            [[
+                [?e :db/ident :person/name ?tx true]
+                [?e :db/valueType :db.type/string ?tx true]
+                [?e :db/cardinality :db.cardinality/one ?tx true]
+                [?tx :db/txInstant ?ms ?tx true]
+            ]
+            [
+                [65537 :person/name "Ivan" ?tx2 true]
+                [?tx2 :db/txInstant ?ms2 ?tx2 true]
+            ]
+            [
+                [65538 :person/name "Ivan" ?tx3 true]
+                [?tx3 :db/txInstant ?ms3 ?tx3 true]
+            ]]"#);
+
+        assert_transact!(conn, r#"
+            [[:db/retract 65537 :person/name "Ivan"]]"#);
+
+        assert_transact!(conn, r#"
+            [[:db/retract "65537" :person/name "Ivan"]
+            [:db/add "65537" :person/name "Vanya"]]"#);
+
+        // Assert that our datoms are now the schema and the final assertion.
+        assert_matches!(conn.datoms(), r#"
+            [[?e1 :db/ident :person/name]
+            [?e1 :db/valueType :db.type/string]
+            [?e1 :db/cardinality :db.cardinality/one]
+            [65538 :person/name "Ivan"]
+            [65539 :person/name "Vanya"]]
+        "#);
+
+        // Assert that we have three correct looking transactions.
+        // This will fail if we're not cleaning up the 'datoms' table
+        // after the timeline move.
+        assert_matches!(conn.transactions(), r#"
+            [[
+                [?e1 :db/ident :person/name ?tx1 true]
+                [?e1 :db/valueType :db.type/string ?tx1 true]
+                [?e1 :db/cardinality :db.cardinality/one ?tx1 true]
+                [?e1 :db/unique :db.unique/identity ?tx1 true]
+                [?e1 :db/index true ?tx1 true]
+                [?tx1 :db/txInstant ?ms1 ?tx1 true]
+            ]
+            [
+                [?e2 :person/name "Vanya" ?tx2 true]
+                [?tx2 :db/txInstant ?ms2 ?tx2 true]
+            ]
+            [
+                [?e2 :person/name "Ivan" ?tx3 true]
+                [?e2 :person/name "Vanya" ?tx3 false]
+                [?tx3 :db/txInstant ?ms3 ?tx3 true]
+            ]]
+        "#);
+    }
+
+    #[test]
     fn test_pop_schema() {
         let mut conn = TestConn::default();
         conn.sanitized_partition_map();
@@ -494,7 +579,7 @@ mod tests {
         "#);
     }
 
-        #[test]
+    #[test]
     fn test_pop_schema_all_attributes_component() {
         let mut conn = TestConn::default();
         conn.sanitized_partition_map();
